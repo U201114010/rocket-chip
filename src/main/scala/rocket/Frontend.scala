@@ -65,9 +65,9 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   val icache = outer.icache.module
 
   val tlb = Module(new TLB(log2Ceil(coreInstBytes*fetchWidth), nTLBEntries))
-  val fq = withReset(reset || io.cpu.req.valid) { Module(new Queue(new FrontendResp, 2, flow = true)) }
+  val fq = withReset(reset || io.cpu.req.valid) { Module(new Queue(new FrontendResp, 3, flow = true)) }
 
-  val s1_valid = Reg(init=Bool(false))
+  val s0_valid = io.cpu.req.valid || fq.io.enq.ready
   val s1_pc_ = Reg(UInt(width=vaddrBitsExtended))
   val s1_pc = ~(~s1_pc_ | (coreInstBytes-1)) // discard PC LSBS (this propagates down the pipeline)
   val s1_speculative = Reg(Bool())
@@ -87,26 +87,23 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   val ntpc = ~(~s1_pc | (coreInstBytes*fetchWidth-1)) + UInt(coreInstBytes*fetchWidth)
   val predicted_npc = Wire(init = ntpc)
   val predicted_taken = Wire(init = Bool(false))
-  val s2_replay = s2_valid && (!icache.io.resp.valid || fq.io.enq.valid && !fq.io.enq.ready)
+
+  val s2_replay = Wire(Bool())
+  s2_replay :=
+    (s2_valid && (!icache.io.resp.valid || (fq.io.enq.valid && !fq.io.enq.ready))) ||
+    RegNext(s2_replay && !s0_valid)
   val npc = Mux(s2_replay, s2_pc, predicted_npc)
 
-  val fqPotentialCount = fq.io.count +& (s1_valid +& s2_valid)
-  val s0_valid = io.cpu.req.valid || Mux(fq.io.deq.ready, fqPotentialCount <= fq.entries, fqPotentialCount < fq.entries)
-
-  s1_valid := false
-  when (s0_valid || s2_replay) {
-    s1_valid := true
-    s1_pc_ := io.cpu.npc
-    // consider RVC fetches across blocks to be non-speculative if the first
-    // part was non-speculative
-    val s0_speculative =
-      if (usingCompressed) s1_speculative || s2_valid && !s2_speculative || predicted_taken
-      else Bool(true)
-    s1_speculative := Mux(io.cpu.req.valid, io.cpu.req.bits.speculative, Mux(s2_replay, s2_speculative, s0_speculative))
-  }
+  s1_pc_ := io.cpu.npc
+  // consider RVC fetches across blocks to be non-speculative if the first
+  // part was non-speculative
+  val s0_speculative =
+    if (usingCompressed) s1_speculative || s2_valid && !s2_speculative || predicted_taken
+    else Bool(true)
+  s1_speculative := Mux(io.cpu.req.valid, io.cpu.req.bits.speculative, Mux(s2_replay, s2_speculative, s0_speculative))
 
   s2_valid := false
-  when (s1_valid && !s2_replay && !io.cpu.req.valid) {
+  when (!s2_replay && !io.cpu.req.valid) {
     s2_valid := true
     s2_pc := s1_pc
     s2_speculative := s1_speculative
@@ -123,7 +120,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
     btb.io.btb_update := io.cpu.btb_update
     btb.io.bht_update := io.cpu.bht_update
     btb.io.ras_update := io.cpu.ras_update
-    when (s1_valid && !s2_replay) {
+    when (!s2_replay) {
       btb.io.req.valid := true
       s2_btb_resp_valid := btb.io.resp.valid
       s2_btb_resp_bits := btb.io.resp.bits
@@ -135,7 +132,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   }
 
   io.ptw <> tlb.io.ptw
-  tlb.io.req.valid := s1_valid && !s2_replay
+  tlb.io.req.valid := !s2_replay
   tlb.io.req.bits.vaddr := s1_pc
   tlb.io.req.bits.passthrough := Bool(false)
   tlb.io.req.bits.instruction := Bool(true)
